@@ -1,6 +1,3 @@
-use std::num::NonZeroU8;
-use std::sync::Arc;
-
 use crate::block;
 use crate::block::properties::Direction;
 use crate::block::registry::BlockActionResult;
@@ -14,13 +11,13 @@ use crate::{
     world::chunker,
 };
 use pumpkin_config::ADVANCED_CONFIG;
-use pumpkin_data::entity::{EntityType, entity_from_egg};
+use pumpkin_data::entity::{entity_from_egg, EntityType};
 use pumpkin_data::item::Item;
 use pumpkin_data::sound::Sound;
 use pumpkin_data::sound::SoundCategory;
 use pumpkin_data::world::CHAT;
-use pumpkin_inventory::InventoryError;
 use pumpkin_inventory::player::PlayerInventory;
+use pumpkin_inventory::InventoryError;
 use pumpkin_macros::block_entity;
 use pumpkin_protocol::client::play::{
     CBlockEntityData, COpenSignEditor, CSetContainerSlot, CSetHeldItem, EquipmentSlot,
@@ -45,15 +42,18 @@ use pumpkin_util::math::boundingbox::BoundingBox;
 use pumpkin_util::math::position::BlockPos;
 use pumpkin_util::text::color::NamedColor;
 use pumpkin_util::{
-    GameMode,
     math::{vector3::Vector3, wrap_degrees},
     text::TextComponent,
+    GameMode,
 };
 use pumpkin_world::block::interactive::sign::Sign;
-use pumpkin_world::block::registry::Block;
 use pumpkin_world::block::registry::get_block_collision_shapes;
-use pumpkin_world::block::{BlockDirection, registry::get_block_by_item};
+use pumpkin_world::block::registry::Block;
+use pumpkin_world::block::{registry::get_block_by_item, BlockDirection};
 use pumpkin_world::item::ItemStack;
+use std::num::NonZeroU8;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use pumpkin_world::{WORLD_LOWEST_Y, WORLD_MAX_Y};
 use thiserror::Error;
@@ -824,6 +824,7 @@ impl Player {
                         );
                         return;
                     }
+
                     let location = player_action.location;
                     let entity = &self.living_entity.entity;
                     let world = &entity.world.read().await;
@@ -846,15 +847,26 @@ impl Player {
                         }
                         return;
                     }
-                    self.start_mining_time.store(
-                        self.tick_counter.load(std::sync::atomic::Ordering::Relaxed),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
+
+                    self.start_mining_time
+                        .store(self.tick_counter.load(Ordering::Relaxed), Ordering::Relaxed);
+
                     if let Ok(block) = block {
                         if !state.air {
-                            let speed = block::calc_block_breaking(&self, state, &block.name).await;
-                            // Instant break
-                            if speed >= 1.0 {
+                            // Calculate ticks that have passed since mining started
+                            let elapsed_ticks = self.tick_counter.load(Ordering::Relaxed)
+                                - self.start_mining_time.load(Ordering::Relaxed);
+
+                            // Get the amount of ticks required to break the block
+                            let breaking_ticks =
+                                block::calc_ticks_required_to_break(&self, state, &block.name)
+                                    .await;
+
+                            // Calculate relative progress percentage between 0 and 1
+                            let progress = elapsed_ticks as f32 / breaking_ticks as f32;
+
+                            // Instant break if ticks required is 1
+                            if breaking_ticks == 1 {
                                 world
                                     .break_block(server, &location, Some(self.clone()), true)
                                     .await;
@@ -866,10 +878,14 @@ impl Player {
                                 self.mining
                                     .store(true, std::sync::atomic::Ordering::Relaxed);
                                 *self.mining_pos.lock().await = location;
-                                let progress = (speed * 10.0) as i32;
-                                world.set_block_breaking(entity, location, progress).await;
+
+                                // Convert relative percentage to 10-stage block breaking animation
+                                let destroy_stage = (progress * 10.0).floor() as i32;
+                                world
+                                    .set_block_breaking(entity, location, destroy_stage)
+                                    .await;
                                 self.current_block_destroy_stage
-                                    .store(progress, std::sync::atomic::Ordering::Relaxed);
+                                    .store(destroy_stage, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
                     }
@@ -886,6 +902,8 @@ impl Player {
                     }
                     self.mining
                         .store(false, std::sync::atomic::Ordering::Relaxed);
+                    // Reset start_mining_time when cancelling
+                    self.start_mining_time.store(0, Ordering::Relaxed);
                     let entity = &self.living_entity.entity;
                     let world = &entity.world.read().await;
                     world

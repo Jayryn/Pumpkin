@@ -19,8 +19,8 @@ use properties::{
 };
 use pumpkin_data::entity::EntityType;
 use pumpkin_data::item::Item;
-use pumpkin_util::math::position::BlockPos;
 use pumpkin_util::math::vector3::Vector3;
+use pumpkin_util::{GameMode, math::position::BlockPos};
 use pumpkin_world::block::registry::{Block, State};
 use pumpkin_world::item::ItemStack;
 use rand::Rng;
@@ -70,20 +70,34 @@ pub async fn drop_loot(server: &Server, world: &Arc<World>, block: &Block, pos: 
     item_entity.send_meta_packet().await;
 }
 
-pub async fn calc_block_breaking(player: &Player, state: &State, block_name: &str) -> f32 {
-    let hardness = state.hardness;
-    #[expect(clippy::float_cmp)]
-    if hardness == -1.0 {
-        // unbreakable
-        return 0.0;
+// Calculates how many game ticks it takes for a player to break a block
+pub async fn calc_ticks_required_to_break(player: &Player, state: &State, block_name: &str) -> i32 {
+    if player.get_gamemode() == GameMode::Creative {
+        return 1; // Creative mode breaks instantly
     }
-    let i = if player.can_harvest(state, block_name).await {
-        30
-    } else {
-        100
-    };
 
-    player.get_mining_speed(block_name).await / hardness / i as f32
+    let block_hardness = state.hardness;
+    if block_hardness.eq(&-1.0) {
+        return -1; // Unbreakable block
+    }
+
+    // TODO implement BAMBOO instant breaking using swords logic
+
+    let mining_speed = player.get_mining_speed(state, block_name).await;
+    let mut damage = mining_speed / block_hardness;
+
+    // Apply penalty for using incorrect tool
+    if player.can_harvest(state, block_name).await {
+        damage /= 30.0;
+    } else {
+        damage /= 100.0;
+    }
+
+    if damage >= 1.0 {
+        return 1; // Instant break
+    }
+
+    (1.0 / damage).ceil() as i32
 }
 
 #[must_use]

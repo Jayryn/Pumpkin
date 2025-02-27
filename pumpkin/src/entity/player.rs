@@ -1,13 +1,3 @@
-use pumpkin_world::block::registry::State;
-use std::{
-    num::NonZeroU8,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering},
-    },
-    time::{Duration, Instant},
-};
-
 use async_trait::async_trait;
 use crossbeam::atomic::AtomicCell;
 use pumpkin_config::{ADVANCED_CONFIG, BASIC_CONFIG};
@@ -61,7 +51,16 @@ use pumpkin_util::{
     permission::PermissionLvl,
     text::TextComponent,
 };
+use pumpkin_world::block::registry::State;
 use pumpkin_world::{cylindrical_chunk_iterator::Cylindrical, item::ItemStack};
+use std::{
+    num::NonZeroU8,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering},
+    },
+    time::{Duration, Instant},
+};
 use tokio::sync::{Mutex, Notify, RwLock};
 
 use super::{
@@ -455,6 +454,7 @@ impl Player {
         {
             return;
         }
+
         if self.packet_sequence.load(Ordering::Relaxed) > -1 {
             self.client
                 .send_packet(&CAcknowledgeBlockChange::new(
@@ -470,6 +470,7 @@ impl Player {
             let world = self.world().await;
             let block = world.get_block(&pos).await.unwrap();
             let state = world.get_block_state(&pos).await.unwrap();
+
             // Is block broken ?
             if state.air {
                 world
@@ -528,15 +529,21 @@ impl Player {
         block_name: &str,
         starting_time: i32,
     ) {
-        let time = self.tick_counter.load(Ordering::Relaxed) - starting_time;
-        let speed = block::calc_block_breaking(self, state, block_name).await * (time + 1) as f32;
-        let progress = (speed * 10.0) as i32;
-        if progress != self.current_block_destroy_stage.load(Ordering::Relaxed) {
+        // Calculate ticks that have passed since mining started
+        let elapsed_ticks = self.tick_counter.load(Ordering::Relaxed) - starting_time;
+        // Get the amount of ticks required to break the block
+        let breaking_ticks = block::calc_ticks_required_to_break(self, state, block_name).await;
+        // Calculate relative progress percentage between 0 and 1
+        let progress = elapsed_ticks as f32 / breaking_ticks as f32;
+
+        // Convert relative percentage to 10-stage block breaking animation
+        let destroy_stage = (progress * 10.0).floor() as i32;
+        if destroy_stage != self.current_block_destroy_stage.load(Ordering::Relaxed) {
             world
-                .set_block_breaking(&self.living_entity.entity, location, progress)
+                .set_block_breaking(&self.living_entity.entity, location, destroy_stage)
                 .await;
             self.current_block_destroy_stage
-                .store(progress, Ordering::Relaxed);
+                .store(destroy_stage, Ordering::Relaxed);
         }
     }
 
@@ -948,14 +955,23 @@ impl Player {
                 .map_or_else(|| false, |e| e.is_correct_for_drops(block_name))
     }
 
-    pub async fn get_mining_speed(&self, block_name: &str) -> f32 {
+    // Return the mining speed of a tool with active modifiers on a specific block
+    pub async fn get_mining_speed(&self, state: &State, block_name: &str) -> f32 {
         let mut speed = self
             .inventory
             .lock()
             .await
             .get_mining_speed(block_name)
             .await;
-        // Haste
+
+        // Apply efficiency modifier only when using correct tool
+        if self.can_harvest(state, block_name).await {
+            // TODO account for mining efficiency level
+        } else {
+            speed = 1.0;
+        }
+
+        // Apply haste / conduit power effect multiplier
         if self.living_entity.has_effect(EffectType::Haste).await
             || self
                 .living_entity
@@ -964,7 +980,8 @@ impl Player {
         {
             speed *= 1.0 + (self.get_haste_amplifier().await + 1) as f32 * 0.2;
         }
-        // Fatigue
+
+        // Apply fatigue effect penalty
         if let Some(fatigue) = self
             .living_entity
             .get_effect(EffectType::MiningFatigue)
@@ -978,8 +995,11 @@ impl Player {
             };
             speed *= fatigue_speed;
         }
-        // TODO: Handle when in Water
-        if !self.living_entity.entity.on_ground.load(Ordering::Relaxed) {
+
+        // TODO also account for multiplier from attribute BLOCK_BREAK_SPEED and Aqua Affinity enchantment if in water
+
+        // Penalty for breaking while in air or water
+        if !self.is_on_ground() {
             speed /= 5.0;
         }
         speed
@@ -1150,6 +1170,16 @@ impl Player {
         let (new_level, new_points) = experience::total_to_level_and_points(new_total_exp);
         let progress = experience::progress_in_level(new_level, new_points);
         self.set_experience(new_level, progress, new_points).await;
+    }
+
+    // Return boolean indicating if the player is on the ground
+    pub fn is_on_ground(&self) -> bool {
+        self.living_entity.entity.on_ground.load(Ordering::Relaxed)
+    }
+
+    // Return the player's current gamemode
+    pub fn get_gamemode(&self) -> GameMode {
+        self.gamemode.load()
     }
 }
 
